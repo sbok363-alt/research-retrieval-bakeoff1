@@ -113,6 +113,88 @@ jobs:
           Path("benchmark/results/adapter-revision.txt").write_text("0.1.1-compat\\n")
           PY
 
+      - name: Apply adapter compatibility revision r1
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          # B04: pagination query parameters identify different pages.
+          for name in ("scrapling_adapter.py", "crawl4ai_adapter.py"):
+              p = Path("benchmark/adapters") / name
+              s = p.read_text()
+              s = s.replace(
+                  "while url and canonical_url(url) not in seen_pages:",
+                  "while url and url not in seen_pages:",
+              )
+              s = s.replace(
+                  "seen_pages.add(canonical_url(url))",
+                  "seen_pages.add(url)",
+              )
+              p.write_text(s)
+
+          # B05: a valid 200 response is a successful Crawl4AI session retrieval,
+          # even if Crawl4AI's internal success flag is false.
+          p = Path("benchmark/adapters/crawl4ai_adapter.py")
+          s = p.read_text()
+          s = s.replace(
+              "return result(bool(r2.success), out, visible, ops=2, attempts=2)",
+              "return result(int(r2.status_code or 0) == 200, out, visible, ops=2, attempts=2, notes=f\"crawl4ai success={bool(r2.success)}; error={getattr(r2, 'error_message', '')!r}\")",
+          )
+          p.write_text(s)
+
+          # Playwright CLI run-code does not expose Node's global URL.
+          # Resolve URLs in browser page context instead.
+          p = Path("benchmark/adapters/playwright_cli_adapter.py")
+          s = p.read_text()
+          s = s.replace(
+              "const origin = new URL(page.url()).origin;",
+              "const origin = await page.evaluate(() => location.origin);",
+          )
+          s = s.replace(
+              "const next=q.shift(); const u=new URL(next); u.hash=''; u.search=''; const canon=u.toString();",
+              "const next=q.shift(); await page.goto(next); await page.waitForLoadState('domcontentloaded'); const meta=await page.evaluate(() => ({canon: location.origin + location.pathname, pathname: location.pathname, links: [...document.querySelectorAll('a[href]')].map(a => ({href:a.href, origin:new URL(a.href).origin, pathname:new URL(a.href).pathname}))})); const canon=meta.canon;",
+          )
+          s = s.replace(
+              "if(seen.has(canon)) continue; seen.add(canon);\n                  await page.goto(canon); await page.waitForLoadState('domcontentloaded');\n                  counts[u.pathname]=(counts[u.pathname]||0)+1;\n                  if(u.pathname!='/docs/') {\n                    pages.add(u.pathname);",
+              "if(seen.has(canon)) continue; seen.add(canon);\n                  counts[meta.pathname]=(counts[meta.pathname]||0)+1;\n                  if(meta.pathname!='/docs/') {\n                    pages.add(meta.pathname);",
+          )
+          s = s.replace(
+              "const hrefs=await page.locator('a[href]').evaluateAll(as=>as.map(a=>a.href));\n                  for(const h of hrefs){ const v=new URL(h); v.hash=''; v.search=''; if(v.origin===origin && v.pathname.startsWith('/docs/') && !seen.has(v.toString())) q.push(v.toString()); }",
+              "for(const link of meta.links){ if(link.origin===origin && link.pathname.startsWith('/docs/')) { const canon=link.origin+link.pathname; if(!seen.has(canon)) q.push(canon); } }",
+          )
+          s = s.replace(
+              "const href=await page.locator('a[href]').first().getAttribute('href');\n                const response=await page.goto(new URL(href, page.url()).toString()); await page.waitForLoadState('domcontentloaded');",
+              "const absoluteHref=await page.locator('a[href]').first().evaluate(a=>a.href);\n                const response=await page.goto(absoluteHref); await page.waitForLoadState('domcontentloaded');",
+          )
+          p.write_text(s)
+
+          # Fail before installation if an expected patch did not land.
+          checks = {
+              "benchmark/adapters/scrapling_adapter.py": [
+                  "while url and url not in seen_pages:",
+                  "seen_pages.add(url)",
+              ],
+              "benchmark/adapters/crawl4ai_adapter.py": [
+                  "while url and url not in seen_pages:",
+                  "int(r2.status_code or 0) == 200",
+              ],
+              "benchmark/adapters/playwright_cli_adapter.py": [
+                  "const origin = await page.evaluate(() => location.origin);",
+                  "const absoluteHref=await page.locator('a[href]').first().evaluate(a=>a.href);",
+              ],
+          }
+          for path, needles in checks.items():
+              text = Path(path).read_text()
+              for needle in needles:
+                  assert needle in text, (path, needle)
+
+          import py_compile
+          for path in checks:
+              py_compile.compile(path, doraise=True)
+          print("adapter revision r1 applied and syntax-checked")
+          PY
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
