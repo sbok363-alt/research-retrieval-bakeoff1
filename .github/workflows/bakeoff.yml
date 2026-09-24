@@ -1,4 +1,4 @@
-name: Frozen Retrieval Bake-off v0.1
+name: Frozen retrieval bake-off v0.1
 
 on:
   push:
@@ -17,89 +17,158 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify and unpack frozen source
-        shell: bash
-        run: |
-          set -euo pipefail
-          base64 -d benchmark-src.tar.gz.b64 > /tmp/bakeoff-src.tar.gz
-          echo "eaa8d4b69846011d3d4cce65a6189b63aa4632d48181c38e35379d614c419bc3  /tmp/bakeoff-src.tar.gz" | sha256sum -c -
-          tar -xzf /tmp/bakeoff-src.tar.gz
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: '22'
 
-      - name: Install pinned Python candidates
+      - name: Reconstruct frozen benchmark
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install "playwright==1.62.0" "scrapling[all]==0.4.15" "Crawl4AI==0.9.4"
+          cat bundle/part-*.b64 | base64 --decode > benchmark-v0.1.zip
+          echo "3789f8eb90eefa38439b6b1f46a3186f664916f9918d9cfa928e76a4d73c3159  benchmark-v0.1.zip" | sha256sum -c -
+          rm -rf benchmark
+          mkdir benchmark
+          unzip -q benchmark-v0.1.zip -d benchmark
+          mkdir -p benchmark/results/raw
 
-      - name: Install browser dependencies
+      - name: Install shared harness dependencies
+        run: python -m pip install --upgrade requests beautifulsoup4
+
+      - name: Install pinned Scrapling 0.4.15
         shell: bash
         run: |
-          set -euo pipefail
-          python -m playwright install --with-deps chromium
-          scrapling install --force
+          python -m venv .venv-scrapling
+          .venv-scrapling/bin/python -m pip install --upgrade pip
+          .venv-scrapling/bin/python -m pip install "scrapling[all]==0.4.15" requests beautifulsoup4
+          .venv-scrapling/bin/scrapling install --force
+          .venv-scrapling/bin/python - <<'PY'
+          import importlib.metadata
+          v=importlib.metadata.version('scrapling')
+          assert v == '0.4.15', v
+          print('Scrapling', v)
+          PY
 
-      - name: Install pinned Playwright CLI
+      - name: Resolve system Chromium for Scrapling
         shell: bash
         run: |
-          set -euo pipefail
-          npm install -g @playwright/cli@0.1.21 playwright@1.64.0-alpha-1789764292000
-          playwright install chromium
+          BROWSER="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
+          if [ -z "$BROWSER" ]; then
+            echo "No system Chromium/Chrome found"
+            exit 1
+          fi
+          echo "CHROMIUM_PATH=$BROWSER" >> "$GITHUB_ENV"
+          echo "Scrapling browser: $BROWSER"
+
+      - name: Install pinned Crawl4AI 0.9.4
+        shell: bash
+        run: |
+          python -m venv .venv-crawl4ai
+          .venv-crawl4ai/bin/python -m pip install --upgrade pip
+          .venv-crawl4ai/bin/python -m pip install "crawl4ai==0.9.4" requests beautifulsoup4
+          .venv-crawl4ai/bin/crawl4ai-setup
+          .venv-crawl4ai/bin/python -m playwright install --with-deps chromium
+          .venv-crawl4ai/bin/python - <<'PY'
+          import importlib.metadata
+          v=importlib.metadata.version('crawl4ai')
+          assert v == '0.9.4', v
+          print('Crawl4AI', v)
+          PY
+
+      - name: Install pinned Playwright CLI 0.1.21
+        shell: bash
+        run: |
+          npm install --global @playwright/cli@0.1.21
           playwright-cli --version
+          playwright-cli --version | grep -F '0.1.21'
+          playwright-cli install-browser chromium
 
-      - name: Resolve Python Chromium executable
+      - name: Start deterministic fixture server
+        working-directory: benchmark
         shell: bash
         run: |
-          set -euo pipefail
-          CHROMIUM_PATH="$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
-          test -x "$CHROMIUM_PATH"
-          echo "CHROMIUM_PATH=$CHROMIUM_PATH" >> "$GITHUB_ENV"
-
-      - name: Preflight
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p results/raw
-          python preflight.py | tee results/preflight-ci.json
-
-      - name: Run frozen Track A
-        shell: bash
-        env:
-          BAKEOFF_BASE_URL: http://127.0.0.1:8765
-        run: |
-          set -euo pipefail
-          mkdir -p results/raw
-          python benchmark_server.py --port 8765 > results/server.log 2>&1 &
-          SERVER_PID=$!
-          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
-          for i in {1..30}; do
-            if curl --fail --silent http://127.0.0.1:8765/__health > /dev/null; then
-              break
+          nohup python benchmark_server.py --port 8765 > results/server.log 2>&1 &
+          echo $! > results/server.pid
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8765/__health >/dev/null; then
+              echo "Fixture server healthy"
+              exit 0
             fi
-            sleep 0.2
+            sleep 1
           done
-          curl --fail --silent http://127.0.0.1:8765/__health
-          for candidate in scrapling crawl4ai playwright_cli; do
-            echo "=== $candidate ==="
-            python run_track_a.py "$candidate"
-            python grade.py "results/$candidate.json" | tee "results/$candidate.grade.json"
-          done
+          cat results/server.log
+          exit 1
 
-      - name: Upload results
+      - name: Run Scrapling Track A
+        id: scrapling
+        continue-on-error: true
+        working-directory: benchmark
+        shell: bash
+        run: |
+          ../.venv-scrapling/bin/python run_track_a.py scrapling
+          ../.venv-scrapling/bin/python grade.py results/scrapling.json | tee results/scrapling.grade.json
+
+      - name: Run Crawl4AI Track A
+        id: crawl4ai
+        continue-on-error: true
+        working-directory: benchmark
+        shell: bash
+        run: |
+          ../.venv-crawl4ai/bin/python run_track_a.py crawl4ai
+          ../.venv-crawl4ai/bin/python grade.py results/crawl4ai.json | tee results/crawl4ai.grade.json
+
+      - name: Run Playwright CLI Track A
+        id: playwright_cli
+        continue-on-error: true
+        working-directory: benchmark
+        env:
+          PLAYWRIGHT_CLI: playwright-cli
+        shell: bash
+        run: |
+          python run_track_a.py playwright_cli
+          python grade.py results/playwright_cli.json | tee results/playwright_cli.grade.json
+
+      - name: Build comparison summary
+        if: always()
+        working-directory: benchmark
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          rows=[]
+          for name in ('scrapling','crawl4ai','playwright_cli'):
+              p=Path('results')/f'{name}.grade.json'
+              if p.exists():
+                  d=json.loads(p.read_text())
+                  rows.append({'candidate':name,'score':d.get('score'),'max_score':d.get('max_score'),'hard_fail':d.get('hard_fail')})
+              else:
+                  rows.append({'candidate':name,'score':None,'max_score':100,'hard_fail':None})
+          out={'track':'A','frozen_version':'0.1','rows':rows}
+          Path('results/comparison.json').write_text(json.dumps(out,indent=2)+'\n')
+          print(json.dumps(out,indent=2))
+          PY
+
+      - name: Upload complete benchmark results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: retrieval-bakeoff-v0.1-track-a
-          path: results/
-          if-no-files-found: error
+          name: retrieval-bakeoff-v0.1-results
+          path: benchmark/results/
+          if-no-files-found: warn
           retention-days: 30
+
+      - name: Fail if a candidate did not produce results
+        if: always()
+        working-directory: benchmark
+        shell: bash
+        run: |
+          test -f results/scrapling.json
+          test -f results/crawl4ai.json
+          test -f results/playwright_cli.json
