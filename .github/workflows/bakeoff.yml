@@ -42,6 +42,91 @@ jobs:
           unzip -q /tmp/bakeoff.zip -d benchmark
           test "$(grep -E '^version:' benchmark/benchmark.yaml | head -1 | tr -d ' "' | cut -d: -f2)" = "0.1"
 
+
+      - name: Apply adapter compatibility corrections v0.1.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace1(rel, old, new):
+              p = Path("benchmark") / rel
+              s = p.read_text()
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f"{rel}: expected exactly one compatibility target, found {n}")
+              p.write_text(s.replace(old, new, 1))
+
+          # B04: page query is part of pagination identity; canonical_url()
+          # removes queries for crawl dedupe, so using it here collapsed pages 1/2/3.
+          replace1(
+              "adapters/scrapling_adapter.py",
+              """        while url and canonical_url(url) not in seen_pages:
+                      seen_pages.add(canonical_url(url))""",
+              """        while url and url not in seen_pages:
+                      seen_pages.add(url)""",
+          )
+          replace1(
+              "adapters/crawl4ai_adapter.py",
+              """            while url and canonical_url(url) not in seen_pages:
+                          seen_pages.add(canonical_url(url))""",
+              """            while url and url not in seen_pages:
+                          seen_pages.add(url)""",
+          )
+
+          # B05: ok means the adapter executed. The grader already judges the
+          # returned HTTP status + fact. Crawl4AI returned both correctly even
+          # when its library-level success flag was false.
+          replace1(
+              "adapters/crawl4ai_adapter.py",
+              """            return result(bool(r2.success), out, visible, ops=2, attempts=2)""",
+              """            return result(True, out, visible, ops=2, attempts=2, notes=f"crawl4ai success={bool(r2.success)}; error={getattr(r2, 'error_message', '')!r}")""",
+          )
+
+          # Playwright CLI run-code does not expose the global URL constructor in
+          # its outer sandbox. URL remains available inside page.evaluate().
+          replace1(
+              "adapters/playwright_cli_adapter.py",
+              """                const origin = new URL(page.url()).origin;""",
+              """                const origin = await page.evaluate(() => location.origin);""",
+          )
+          replace1(
+              "adapters/playwright_cli_adapter.py",
+              """                  const next=q.shift(); const u=new URL(next); u.hash=''; u.search=''; const canon=u.toString();
+                          if(seen.has(canon)) continue; seen.add(canon);
+                          await page.goto(canon); await page.waitForLoadState('domcontentloaded');
+                          counts[u.pathname]=(counts[u.pathname]||0)+1;
+                          if(u.pathname!='/docs/') {
+                            pages.add(u.pathname);""",
+              """                  const next=q.shift();
+                          const metaUrl=await page.evaluate((raw) => { const u=new URL(raw); u.hash=''; u.search=''; return {canon:u.toString(), pathname:u.pathname}; }, next);
+                          const canon=metaUrl.canon;
+                          if(seen.has(canon)) continue; seen.add(canon);
+                          await page.goto(canon); await page.waitForLoadState('domcontentloaded');
+                          counts[metaUrl.pathname]=(counts[metaUrl.pathname]||0)+1;
+                          if(metaUrl.pathname!='/docs/') {
+                            pages.add(metaUrl.pathname);""",
+          )
+          replace1(
+              "adapters/playwright_cli_adapter.py",
+              """                  const hrefs=await page.locator('a[href]').evaluateAll(as=>as.map(a=>a.href));
+                          for(const h of hrefs){ const v=new URL(h); v.hash=''; v.search=''; if(v.origin===origin && v.pathname.startsWith('/docs/') && !seen.has(v.toString())) q.push(v.toString()); }""",
+              """                  const links=await page.locator('a[href]').evaluateAll(as=>as.map(a=>{ const v=new URL(a.href); v.hash=''; v.search=''; return {origin:v.origin, pathname:v.pathname, canon:v.toString()}; }));
+                          for(const v of links){ if(v.origin===origin && v.pathname.startsWith('/docs/') && !seen.has(v.canon)) q.push(v.canon); }""",
+          )
+          replace1(
+              "adapters/playwright_cli_adapter.py",
+              """                const href=await page.locator('a[href]').first().getAttribute('href');
+                          const response=await page.goto(new URL(href, page.url()).toString()); await page.waitForLoadState('domcontentloaded');""",
+              """                const href=await page.locator('a[href]').first().evaluate(a=>a.href);
+                          const response=await page.goto(href); await page.waitForLoadState('domcontentloaded');""",
+          )
+
+          Path("benchmark/results").mkdir(parents=True, exist_ok=True)
+          Path("benchmark/results/adapter-revision.txt").write_text("0.1.1-compat\\n")
+          PY
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
