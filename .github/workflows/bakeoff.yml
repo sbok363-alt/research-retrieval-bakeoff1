@@ -1,0 +1,148 @@
+name: Frozen Retrieval Bake-off v0.1
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  track-a:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify and unpack frozen source
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d benchmark-src.tar.gz.b64 > /tmp/bakeoff-src.tar.gz
+          echo "eaa8d4b69846011d3d4cce65a6189b63aa4632d48181c38e35379d614c419bc3  /tmp/bakeoff-src.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/bakeoff-src.tar.gz
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pinned Python candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install             "playwright==1.62.0"             "scrapling[all]==0.4.15"             "Crawl4AI==0.9.4"
+
+      - name: Install browser dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m playwright install --with-deps chromium
+          scrapling install --force
+
+      - name: Install pinned Playwright CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g             @playwright/cli@0.1.21             playwright@1.64.0-alpha-1789764292000
+          playwright install chromium
+          playwright-cli --version
+
+      - name: Resolve Python Chromium executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHROMIUM_PATH="$(python - <<'PY'
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    print(p.chromium.executable_path)
+PY
+)"
+          test -x "$CHROMIUM_PATH"
+          echo "CHROMIUM_PATH=$CHROMIUM_PATH" >> "$GITHUB_ENV"
+
+      - name: Preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/raw
+          python preflight.py | tee results/preflight-ci.json
+
+      - name: Run frozen Track A
+        shell: bash
+        env:
+          BAKEOFF_BASE_URL: http://127.0.0.1:8765
+        run: |
+          set -euo pipefail
+          mkdir -p results/raw
+
+          python benchmark_server.py --port 8765 > results/server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+          for i in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8765/__health > /dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+          curl --fail --silent http://127.0.0.1:8765/__health
+
+          for candidate in scrapling crawl4ai playwright_cli; do
+            echo "=== $candidate ==="
+            python run_track_a.py "$candidate"
+            python grade.py "results/$candidate.json" | tee "results/$candidate.grade.json"
+          done
+
+      - name: Build Track A summary
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+import json
+from pathlib import Path
+
+rows = []
+for candidate in ("scrapling", "crawl4ai", "playwright_cli"):
+    p = Path("results") / f"{candidate}.grade.json"
+    if not p.exists():
+        rows.append({"candidate": candidate, "status": "missing"})
+        continue
+    d = json.loads(p.read_text())
+    rows.append({
+        "candidate": candidate,
+        "track_a_score": d.get("score"),
+        "track_a_max": 80,
+        "hard_fail": d.get("hard_fail"),
+        "tasks": d.get("tasks"),
+    })
+
+summary = {
+    "benchmark": "research-retrieval-bakeoff",
+    "version": "0.1",
+    "track": "A",
+    "source_bundle_sha256": "eaa8d4b69846011d3d4cce65a6189b63aa4632d48181c38e35379d614c419bc3",
+    "results": rows,
+}
+Path("results/track-a-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+print(json.dumps(summary, indent=2))
+PY
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-bakeoff-v0.1-track-a
+          path: results/
+          if-no-files-found: error
+          retention-days: 30
