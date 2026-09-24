@@ -1,0 +1,99 @@
+name: Retrieval bake-off v0.1 adapter-fix r1
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  track-a:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Restore verified frozen v0.1 source and overlay adapter fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL             https://raw.githubusercontent.com/sbok363-alt/research-retrieval-bakeoff1/3c9032668d2fe303411d38e060a220f8058a63ac/benchmark-src.tar.gz.b64             -o /tmp/bakeoff-src.tar.gz.b64
+          base64 -d /tmp/bakeoff-src.tar.gz.b64 > /tmp/bakeoff-src.tar.gz
+          echo "eaa8d4b69846011d3d4cce65a6189b63aa4632d48181c38e35379d614c419bc3  /tmp/bakeoff-src.tar.gz" | sha256sum -c -
+          rm -rf adapter-fix-r1/work
+          mkdir -p adapter-fix-r1/work
+          tar -xzf /tmp/bakeoff-src.tar.gz -C adapter-fix-r1/work
+          python adapter-fix-r1/patch_adapters.py adapter-fix-r1/work
+          python -m py_compile             adapter-fix-r1/work/adapters/*.py             adapter-fix-r1/work/run_track_a.py             adapter-fix-r1/work/grade.py             adapter-fix-r1/work/benchmark_server.py             adapter-fix-r1/work/preflight.py
+
+      - name: Install exact candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "playwright==1.62.0" "scrapling[all]==0.4.15" "Crawl4AI==0.9.4"
+          python -m playwright install --with-deps chromium
+          scrapling install --force
+          npm install -g @playwright/cli@0.1.21 playwright@1.64.0-alpha-1789764292000
+          playwright install chromium
+          playwright-cli --version
+
+      - name: Resolve Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHROMIUM_PATH="$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
+          test -x "$CHROMIUM_PATH"
+          echo "CHROMIUM_PATH=$CHROMIUM_PATH" >> "$GITHUB_ENV"
+
+      - name: Preflight
+        working-directory: adapter-fix-r1/work
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/raw
+          python preflight.py | tee results/preflight-ci.json
+
+      - name: Run frozen Track A
+        working-directory: adapter-fix-r1/work
+        env:
+          BAKEOFF_BASE_URL: http://127.0.0.1:8765
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/raw
+          python benchmark_server.py --port 8765 > results/server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for i in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8765/__health > /dev/null; then break; fi
+            sleep 0.2
+          done
+          curl --fail --silent http://127.0.0.1:8765/__health
+          for candidate in scrapling crawl4ai playwright_cli; do
+            echo "=== $candidate ==="
+            python run_track_a.py "$candidate"
+            python grade.py "results/$candidate.json" | tee "results/$candidate.grade.json"
+          done
+
+      - name: Upload corrected results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-bakeoff-v0.1-adapter-fix-r1
+          path: adapter-fix-r1/work/results/
+          if-no-files-found: error
+          retention-days: 30
