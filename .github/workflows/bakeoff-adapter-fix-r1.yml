@@ -11,20 +11,10 @@ jobs:
   track-a:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Verify and unpack corrected adapter bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-          base64 -d adapter-fix-r1/bakeoff-src-fixed.tar.gz.b64 > /tmp/bakeoff-src.tar.gz
-          echo "bcc09c8efdce00ddf77e7a63be0206d86df18ad0336503d89a1c82114f8eb18a  /tmp/bakeoff-src.tar.gz" | sha256sum -c -
-          mkdir -p adapter-fix-r1/work
-          tar -xzf /tmp/bakeoff-src.tar.gz -C adapter-fix-r1/work
-          cd adapter-fix-r1/work
-          python -m py_compile adapters/*.py run_track_a.py grade.py benchmark_server.py preflight.py
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,6 +25,19 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+
+      - name: Restore verified frozen v0.1 source and overlay adapter fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL             https://raw.githubusercontent.com/sbok363-alt/research-retrieval-bakeoff1/3c9032668d2fe303411d38e060a220f8058a63ac/benchmark-src.tar.gz.b64             -o /tmp/bakeoff-src.tar.gz.b64
+          base64 -d /tmp/bakeoff-src.tar.gz.b64 > /tmp/bakeoff-src.tar.gz
+          echo "eaa8d4b69846011d3d4cce65a6189b63aa4632d48181c38e35379d614c419bc3  /tmp/bakeoff-src.tar.gz" | sha256sum -c -
+          rm -rf adapter-fix-r1/work
+          mkdir -p adapter-fix-r1/work
+          tar -xzf /tmp/bakeoff-src.tar.gz -C adapter-fix-r1/work
+          python adapter-fix-r1/patch_adapters.py adapter-fix-r1/work
+          python -m py_compile             adapter-fix-r1/work/adapters/*.py             adapter-fix-r1/work/run_track_a.py             adapter-fix-r1/work/grade.py             adapter-fix-r1/work/benchmark_server.py             adapter-fix-r1/work/preflight.py
 
       - name: Install exact candidates
         shell: bash
