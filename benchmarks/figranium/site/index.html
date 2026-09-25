@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Figranium Benchmark Fixture</title></head>
+<body>
+  <main>
+    <label for="name">Name</label>
+    <input id="name" aria-label="Name" value="">
+    <button id="go" type="button">Generate</button>
+    <div id="result" role="status"></div>
+  </main>
+  <script>
+    document.getElementById('go').addEventListener('click', () => {
+      const value = document.getElementById('name').value.trim();
+      const result = document.getElementById('result');
+      result.textContent = 'Hello, ' + value + '!';
+      result.classList.add('ready');
+    });
+  </script>
+</body>
+</html>
