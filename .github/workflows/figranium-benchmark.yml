@@ -1,0 +1,156 @@
+name: Figranium Benchmark 1
+
+on:
+  push:
+    branches:
+      - benchmark/figranium-1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repair-loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      FIGRANIUM_REF: v0.18.5
+      FIGRANIUM_SHA: 02bc8dc9a11d99f1eacba825c0b182d18263f26c
+      FIGRANIUM_MCP_REF: v1.3.3
+      FIGRANIUM_MCP_SHA: 869fdaf2acc72c51cfbe6a2ceec37015d6382bb9
+      FIGRANIUM_API_KEY: fig_benchmark_local_only_20260925
+      FIGRANIUM_BASE_URL: http://127.0.0.1:11345
+      BENCH_TARGET_URL: http://127.0.0.1:11346/
+      SKIP_LOCAL_CAPTCHA_MODEL: "true"
+
+    steps:
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Checkout exact Figranium source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none https://github.com/figranium/figranium.git figranium-source
+          cd figranium-source
+          git checkout --detach "$FIGRANIUM_SHA"
+          test "$(git rev-parse HEAD)" = "$FIGRANIUM_SHA"
+          node -p "require('./package.json').version" | tee ../figranium-version.txt
+
+      - name: Checkout exact MCP source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none https://github.com/figranium/figranium-mcp.git figranium-mcp-source
+          cd figranium-mcp-source
+          git checkout --detach "$FIGRANIUM_MCP_SHA"
+          test "$(git rev-parse HEAD)" = "$FIGRANIUM_MCP_SHA"
+          node -p "require('./package.json').version" | tee ../figranium-mcp-version.txt
+
+      - name: Install Figranium and Chromium
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd figranium-source
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
+          mkdir -p data
+          printf '{"apiKey":"%s"}\n' "$FIGRANIUM_API_KEY" > data/api_key.json
+
+      - name: Build MCP server
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd figranium-mcp-source
+          npm ci
+          npm run build
+
+      - name: Start deterministic fixture site
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 -m http.server 11346 --bind 127.0.0.1 --directory "$GITHUB_WORKSPACE/benchmarks/figranium/site" > fixture.log 2>&1 &
+          echo $! > fixture.pid
+          for i in {1..30}; do
+            curl -fsS http://127.0.0.1:11346/ >/dev/null && exit 0
+            sleep 1
+          done
+          cat fixture.log || true
+          exit 1
+
+      - name: Start Figranium
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd figranium-source
+          SESSION_SECRET=benchmark-session-secret-not-for-production \
+          ALLOW_PRIVATE_NETWORKS=true \
+          HOST=127.0.0.1 \
+          PORT=11345 \
+          NODE_ENV=development \
+          SKIP_LOCAL_CAPTCHA_MODEL=true \
+          npm start > ../figranium-server.log 2>&1 &
+          echo $! > ../figranium-server.pid
+          cd ..
+          for i in {1..90}; do
+            if curl -fsS -H "x-api-key: $FIGRANIUM_API_KEY" http://127.0.0.1:11345/api/health > health.json; then
+              cat health.json
+              exit 0
+            fi
+            sleep 1
+          done
+          cat figranium-server.log || true
+          exit 1
+
+      - name: Run MCP validation-execution-repair benchmark
+        id: benchmark
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cp benchmarks/figranium/benchmark-runner.mjs figranium-mcp-source/benchmark-runner.mjs
+          cd figranium-mcp-source
+          BENCH_RESULT_JSON=../figranium-benchmark-result.json \
+          BENCH_SUMMARY_MD=../figranium-benchmark-summary.md \
+          node benchmark-runner.mjs | tee ../figranium-benchmark.log
+
+      - name: Collect evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p figranium-benchmark-evidence
+          cp figranium-version.txt figranium-benchmark-evidence/ 2>/dev/null || true
+          cp figranium-mcp-version.txt figranium-benchmark-evidence/ 2>/dev/null || true
+          cp health.json figranium-benchmark-evidence/ 2>/dev/null || true
+          cp figranium-server.log figranium-benchmark-evidence/ 2>/dev/null || true
+          cp fixture.log figranium-benchmark-evidence/ 2>/dev/null || true
+          cp figranium-benchmark.log figranium-benchmark-evidence/ 2>/dev/null || true
+          cp figranium-benchmark-result.json figranium-benchmark-evidence/ 2>/dev/null || true
+          cp figranium-benchmark-summary.md figranium-benchmark-evidence/ 2>/dev/null || true
+          if [ -f figranium-benchmark-summary.md ]; then
+            cat figranium-benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: figranium-benchmark-1-evidence
+          path: figranium-benchmark-evidence
+          if-no-files-found: warn
+
+      - name: Enforce verdict
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.benchmark.outcome }}" != "success" ]; then
+            echo "FAIL/INCONCLUSIVE: benchmark runner did not pass."
+            exit 1
+          fi
+          node -e "const r=require('./figranium-benchmark-result.json'); if(!r.passed) process.exit(1)"
+          echo "PASS: Figranium MCP validation -> execution -> semantic inspection -> repair -> re-execution loop passed."
