@@ -1,0 +1,116 @@
+name: BOSS Console Benchmark 1
+
+on:
+  push:
+    branches:
+      - benchmark/boss-console-1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BOSS_REF: v9.5.24
+      BOSS_SOURCE: boss-source
+      JAVA_TOOL_OPTIONS: -Djava.awt.headless=true
+
+    steps:
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Resolve exact BOSS release source
+        id: resolve
+        shell: bash
+        run: |
+          set -u
+          mkdir -p boss-source
+          cd boss-source
+          git init
+          git remote add origin https://github.com/risa-labs-inc/BossConsole.git
+          if git fetch --depth=1 origin refs/tags/${BOSS_REF}:refs/tags/${BOSS_REF}; then
+            git checkout --detach ${BOSS_REF}
+            SHA="$(git rev-parse HEAD)"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            echo "$SHA" > ../boss-source-sha.txt
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "sha=unresolved" >> "$GITHUB_OUTPUT"
+            echo "BOSS source tag ${BOSS_REF} was not available." > ../boss-source-resolution.txt
+          fi
+
+      - name: Record BOSS version
+        id: version
+        if: steps.resolve.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          cd boss-source
+          chmod +x gradlew
+          ./gradlew --no-daemon -q showVersion | tee ../boss-version.txt
+
+      - name: Run governance-core benchmark tests
+        id: tests
+        if: steps.resolve.outputs.available == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cd boss-source
+          ./gradlew --no-daemon :composeApp:desktopTest             --tests 'ai.rever.boss.mcp.McpToolRegistryCoreTest'             --tests 'ai.rever.boss.mcp.McpKillSwitchPersistenceTest'             --tests 'ai.rever.boss.mcp.McpPolicyEngineTest'             --tests 'ai.rever.boss.mcp.McpSessionTrustScopingTest'             --tests 'ai.rever.boss.mcp.McpProviderPolicyTest'             --tests 'ai.rever.boss.mcp.McpPolicyRevocationTest'             --tests 'ai.rever.boss.mcp.McpProviderRevocationTest'             --tests 'ai.rever.boss.mcp.McpGovernedInvocationTest'             --tests 'ai.rever.boss.mcp.McpRiskGovernanceIntegrationTest'             --tests 'ai.rever.boss.mcp.McpDestructiveShellAllowTest'             --tests 'ai.rever.boss.mcp.McpOperationLedgerTest'             --tests 'ai.rever.boss.mcp.McpLedgerChainTest'             --stacktrace | tee ../boss-gradle.log
+
+      - name: Build evidence summary
+        if: always()
+        shell: bash
+        env:
+          BOSS_AVAILABLE: ${{ steps.resolve.outputs.available || 'false' }}
+          BOSS_SHA: ${{ steps.resolve.outputs.sha || 'unresolved' }}
+          BOSS_VERSION: ${{ steps.version.outcome == 'success' && 'see boss-version.txt' || 'unavailable' }}
+          TEST_OUTCOME: ${{ steps.tests.outcome || 'not-run' }}
+        run: |
+          python benchmarks/boss-console/summarize.py
+          mkdir -p boss-benchmark-evidence
+          cp benchmark-summary.md boss-benchmark-evidence/
+          cp boss-source-sha.txt boss-benchmark-evidence/ 2>/dev/null || true
+          cp boss-source-resolution.txt boss-benchmark-evidence/ 2>/dev/null || true
+          cp boss-version.txt boss-benchmark-evidence/ 2>/dev/null || true
+          cp boss-gradle.log boss-benchmark-evidence/ 2>/dev/null || true
+          if [ -d boss-source/composeApp/build/test-results/desktopTest ]; then
+            cp -R boss-source/composeApp/build/test-results/desktopTest boss-benchmark-evidence/junit
+          fi
+          if [ -d boss-source/composeApp/build/reports/tests/desktopTest ]; then
+            cp -R boss-source/composeApp/build/reports/tests/desktopTest boss-benchmark-evidence/html-report
+          fi
+          cat benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boss-console-benchmark-1-evidence
+          path: boss-benchmark-evidence
+          if-no-files-found: warn
+
+      - name: Enforce benchmark verdict
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.resolve.outputs.available }}" != "true" ]; then
+            echo "BLOCKED: exact BOSS source tag could not be resolved."
+            exit 1
+          fi
+          if [ "${{ steps.tests.outcome }}" != "success" ]; then
+            echo "FAIL/INCONCLUSIVE: governance test step did not pass."
+            exit 1
+          fi
+          echo "PASS: selected governance-core tests passed."
